@@ -3,6 +3,7 @@
 This is just a PoC for now, to try it out, try this from the root of the repo:
 
 ```
+$ redis-server&
 $ export DYLD_LIBRARY_PATH=target/release # on macOS
 $ cargo build -p example-f1 --target wasm32-wasip2 --release
 $ cargo build -p example-f2 --target wasm32-wasip2 --release
@@ -10,6 +11,7 @@ $ cargo build -p example-memdb --target wasm32-wasip2 --release
 $ cargo build -p example-redis --target wasm32-wasip2 --release
 $ cargo build -p example-redis-http --target wasm32-wasip2 --release
 $ cargo build -p example-sockets --target wasm32-wasip2 --release
+$ cargo build -p example-spinloop --target wasm32-wasip2 --release
 $ cargo build -p example-hello
 $ cargo run -- --http-proxy 127.0.0.1:8080
 $ curl -H "X-Wasmlet-Id: redis-http" "localhost:8080/set?key=hello&value=world"
