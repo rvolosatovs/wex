@@ -12,13 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context as _};
 use clap::{command, Parser};
-use futures::StreamExt as _;
-use kube::runtime::WatchStreamExt as _;
-use kube::{CustomResourceExt as _, ResourceExt as _};
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use quanta::Clock;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -27,45 +22,13 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, Layer as _};
 use wasmlet::{
-    apply_manifest, load_and_apply_manifest, read_and_apply_manifest, Engine, Host, Manifest, Wasi,
-    EPOCH_INTERVAL, EPOCH_MONOTONIC_NOW, EPOCH_SYSTEM_NOW,
+    read_and_apply_manifest, Engine, Host, Wasi, EPOCH_INTERVAL, EPOCH_MONOTONIC_NOW,
+    EPOCH_SYSTEM_NOW,
 };
-
-#[derive(
-    Clone, Debug, Deserialize, Serialize, Eq, PartialEq, kube::CustomResource, schemars::JsonSchema,
-)]
-#[kube(
-    group = "wasmcloud.dev",
-    kind = "WasmPod",
-    namespaced,
-    status = PodStatus,
-    version = "v1alpha1"
-)]
-pub struct Pod {
-    #[serde(flatten)]
-    manifest: Manifest,
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, Default, schemars::JsonSchema)]
-pub struct PodStatus {
-    pub error: Box<str>,
-}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
-pub enum Command {
-    Run(RunArgs),
-    #[clap(subcommand)]
-    K8s(KubernetesCommand),
-}
-
-#[derive(Parser, Debug)]
-pub enum KubernetesCommand {
-    Crd,
-}
-
-#[derive(Parser, Debug)]
-pub struct RunArgs {
+pub struct Args {
     #[clap(
         long = "max-instances",
         env = "WASMX_MAX_INSTANCES",
@@ -81,10 +44,6 @@ pub struct RunArgs {
     #[clap(long = "http-proxy", env = "WASMX_HTTP_PROXY")]
     /// HTTP reverse proxy endpoint address
     pub http_proxy: Option<SocketAddr>,
-
-    #[clap(long = "k8s", env = "WASMX_K8S", default_value_t = Box::default())]
-    /// Whether to enable Kubernetes CRD support
-    pub k8s: Box<str>,
 }
 
 /// Computes appropriate resolution of the clock by taking N samples
@@ -137,20 +96,11 @@ fn init_tracing() -> SdkLoggerProvider {
 }
 
 fn main() -> anyhow::Result<()> {
-    let RunArgs {
+    let Args {
         max_instances,
         http_admin,
         http_proxy,
-        k8s,
-    } = match Command::parse() {
-        Command::K8s(KubernetesCommand::Crd) => {
-            let crd =
-                serde_yaml::to_string(&WasmPod::crd()).context("failed to encode WasmPod CRD")?;
-            print!("{crd}");
-            return Ok(());
-        }
-        Command::Run(args) => args,
-    };
+    } = Args::parse();
 
     let clock = Clock::new();
 
@@ -235,95 +185,6 @@ fn main() -> anyhow::Result<()> {
         if let Some(addr) = http_proxy {
             let task = host.handle_http_proxy(addr).await?;
             tasks.spawn(task);
-        }
-        if !k8s.is_empty() {
-            let client = kube::Client::try_default().await?;
-
-            // TODO: Filter
-            let pods: kube::Api<WasmPod> = kube::Api::default_namespaced(client.clone());
-
-            let wc = kube::runtime::watcher::Config::default().any_semantic();
-            let events = kube::runtime::watcher(pods.clone(), wc).default_backoff();
-            let cmds_tx = cmds_tx.clone();
-            tasks.spawn(async move {
-                let (k8s_namespace, k8s_name) = k8s.split_once(':').unwrap_or(("default", &k8s));
-                let mut events = pin!(events);
-                while let Some(event) = events.next().await {
-                    match event {
-                        Ok(
-                            kube::runtime::watcher::Event::Apply(pod)
-                            | kube::runtime::watcher::Event::InitApply(pod),
-                        ) => {
-                            let namespace = pod.namespace();
-                            let namespace = namespace.as_deref().unwrap_or("default");
-                            let name = pod.name_any();
-                            if namespace != k8s_namespace || name != k8s_name {
-                                debug!(namespace, name, "skipping pod apply event");
-                                continue;
-                            }
-                            info!(?pod.spec.manifest, "pod CRD applied, reloading manifest");
-
-                            let version = pod.resource_version();
-                            let status = if let Err(err) =
-                                load_and_apply_manifest(&cmds_tx, pod.spec.manifest).await
-                            {
-                                warn!(?err, "failed to apply manifest");
-                                PodStatus {
-                                    error: format!("{err:#}").into(),
-                                }
-                            } else {
-                                info!("applied manifest");
-                                PodStatus {
-                                    error: Box::default(),
-                                }
-                            };
-                            let status = match serde_json::to_vec(&json!({
-                                "apiVersion": "wasmcloud.dev/v1alpha1",
-                                "kind": "WasmPod",
-                                "metadata": {
-                                    "name": name,
-                                    "resourceVersion": version,
-                                },
-                                "status": status,
-                            })) {
-                                Ok(status) => status,
-                                Err(err) => {
-                                    error!(?err, "failed to encode status to JSON");
-                                    continue;
-                                }
-                            };
-                            if let Err(err) = pods
-                                .replace_status(&name, &kube::api::PostParams::default(), status)
-                                .await
-                            {
-                                error!(?err, "failed to update pod status")
-                            }
-                            continue;
-                        }
-                        Ok(kube::runtime::watcher::Event::Delete(pod)) => {
-                            let namespace = pod.namespace();
-                            let namespace = namespace.as_deref().unwrap_or("default");
-                            let name = pod.name_any();
-                            if namespace != k8s_namespace || name != k8s_name {
-                                debug!(namespace, name, "skipping pod delete event");
-                                continue;
-                            }
-                            info!("pod deleted, reloading manifest");
-                            if let Err(err) = apply_manifest(&cmds_tx, Manifest::default()).await {
-                                error!(?err, "failed to apply manifest");
-                                continue;
-                            }
-                            info!("applied manifest");
-                        }
-                        Ok(event) => {
-                            debug!(?event, "skip pod event")
-                        }
-                        Err(err) => {
-                            error!(?err, "failed to receive pod event");
-                        }
-                    };
-                }
-            });
         }
 
         #[cfg(unix)]

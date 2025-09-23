@@ -3,7 +3,6 @@
 
 [plugins.example]
 src = "example_hello"
-#src = "../wasmlet.go/couchbase/couchbase"
 
 #[services.sockets]
 #src = "./target/wasm32-wasip2/release/example-sockets.wasm"

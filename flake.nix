@@ -198,8 +198,6 @@
               pkgs.wit-deps
 
               pkgs.pkgsUnstable.go
-              pkgs.pkgsUnstable.kubectl
-              pkgs.pkgsUnstable.minikube
             ];
           }
           devShells;
